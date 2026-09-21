@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['v*']
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DMCPWA_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+
+      # The pool, the session gate and the shutdown drain are timing-sensitive.
+      # Once is not enough to trust them.
+      - name: Test repeatedly (shake out races)
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --repeat until-fail:20
+
+      - name: Smoke the exe
+        run: .\build\${{ matrix.config }}\mcp-winauth-bridge.exe --version
+
+      # Consumption mode (b): a separate project resolves the installed package
+      # and links it. Fails if the export set, the include layout or the
+      # winhttp propagation is wrong.
+      - name: Install and build the example consumer
+        run: |
+          cmake --install build --config ${{ matrix.config }} --prefix "${{ github.workspace }}\stage"
+          cmake -S examples/consumer -B build-consumer -G "Visual Studio 17 2022" -A x64 `
+                -DCMAKE_PREFIX_PATH="${{ github.workspace }}\stage"
+          cmake --build build-consumer --config ${{ matrix.config }}
+
+      - name: Upload the release binary
+        if: matrix.config == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-winauth-bridge-x64
+          path: build/Release/mcp-winauth-bridge.exe
+
+  # Consumption mode (c): the sources dropped straight into another project,
+  # no CMake at all. This also catches windows.h leaking out of a public header.
+  dropin-sources:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile the sources directly
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /W4 /permissive- /utf-8 /Zc:preprocessor ^
+             /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN ^
+             /Iinclude /Isrc /Fedropin.exe ^
+             src\*.cpp app\main.cpp winhttp.lib
+          .\dropin.exe --version
