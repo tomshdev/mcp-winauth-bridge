@@ -39,6 +39,31 @@ Error BadArg(const std::wstring& what) {
     return MakeError(Status::InvalidArgument, Narrow(what));
 }
 
+// "unknown-ca,name" -> a TlsIgnore bitmask. Returns false on an unknown name.
+bool ParseTlsIgnoreList(const std::wstring& text, unsigned& out) {
+    unsigned     mask = 0;
+    size_t       pos  = 0;
+    if (text.empty()) return false;
+
+    while (pos <= text.size()) {
+        const size_t comma = text.find(L',', pos);
+        const std::wstring token =
+            text.substr(pos, comma == std::wstring::npos ? std::wstring::npos : comma - pos);
+
+        if (token == L"all")              mask |= TlsIgnoreEverything;
+        else if (token == L"unknown-ca")  mask |= TlsIgnoreUnknownCa;
+        else if (token == L"name")        mask |= TlsIgnoreNameMismatch;
+        else if (token == L"expired")     mask |= TlsIgnoreExpired;
+        else if (token == L"usage")       mask |= TlsIgnoreWrongUsage;
+        else return false;
+
+        if (comma == std::wstring::npos) break;
+        pos = comma + 1;
+    }
+    out = mask;
+    return true;
+}
+
 }  // namespace
 
 Error ParseArgs(const std::vector<std::wstring>& args, CliResult& out) {
@@ -50,6 +75,9 @@ Error ParseArgs(const std::vector<std::wstring>& args, CliResult& out) {
 
         if (a == L"-h" || a == L"--help") { out.showHelp = true; return Error{}; }
         if (a == L"--version")            { out.showVersion = true; return Error{}; }
+
+        // Short flags are handled here: the block below only matches "--".
+        if (a == L"-k") { out.cfg.tlsIgnore = TlsIgnoreEverything; continue; }
 
         // Every remaining flag takes one value.
         auto value = [&](std::wstring& dest) -> bool {
@@ -98,6 +126,14 @@ Error ParseArgs(const std::vector<std::wstring>& args, CliResult& out) {
                 out.cfg.autologonAnyHost = false;
             } else if (a == L"--allow-insecure-auth") {
                 out.cfg.allowInsecureAuth = true;
+            } else if (a == L"--insecure") {
+                out.cfg.tlsIgnore = TlsIgnoreEverything;
+            } else if (a == L"--tls-ignore") {
+                if (!value(v)) return BadArg(a + L" needs a list");
+                unsigned mask = 0;
+                if (!ParseTlsIgnoreList(v, mask))
+                    return BadArg(L"--tls-ignore takes all, unknown-ca, name, expired or usage");
+                out.cfg.tlsIgnore |= mask;
             } else if (a == L"--no-delete-session") {
                 out.cfg.deleteSessionOnShutdown = false;
             } else {
@@ -135,10 +171,21 @@ std::string UsageText(const std::string& programName) {
         "  --drain-timeout <ms>     Wait for in-flight requests at exit, 0 = forever (default 0)\n"
         "  --log-level <l>          error | warn | info | debug (default info)\n"
         "  --no-autologon           Do not send credentials to non-intranet hosts\n"
-        "  --allow-insecure-auth    Allow Windows auth over plain http (exposes the exchange)\n"
+        "  --allow-insecure-auth    Allow Windows auth to an unidentified host (see below)\n"
+        "  -k, --insecure           Waive every TLS certificate check\n"
+        "  --tls-ignore <list>      Waive only some checks. Comma separated:\n"
+        "                             unknown-ca  self-signed or an untrusted CA\n"
+        "                             name        CN/SAN mismatch, e.g. an https://<ip>/ url\n"
+        "                             expired     outside the validity dates\n"
+        "                             usage       wrong key usage\n"
+        "                             all         same as --insecure\n"
         "  --no-delete-session      Skip the DELETE that ends the server session\n"
         "  -h, --help               Show this help\n"
-        "      --version            Show the version\n";
+        "      --version            Show the version\n"
+        "\n"
+        "Waiving the CA or the name check means the server is no longer identified,\n"
+        "so credentials are withheld from non-intranet hosts exactly as they are over\n"
+        "plain http. Add --allow-insecure-auth to send them anyway.\n";
 }
 
 }  // namespace mcpwinauth

@@ -25,6 +25,20 @@ const char* ToString(LogLevel level) {
     return "?";
 }
 
+std::string DescribeTlsIgnore(unsigned tlsIgnoreMask) {
+    if (tlsIgnoreMask == TlsIgnoreNothing) return "nothing";
+    std::string out;
+    auto add = [&out](const char* name) {
+        if (!out.empty()) out += ", ";
+        out += name;
+    };
+    if (tlsIgnoreMask & TlsIgnoreUnknownCa)    add("untrusted CA");
+    if (tlsIgnoreMask & TlsIgnoreNameMismatch) add("name mismatch");
+    if (tlsIgnoreMask & TlsIgnoreExpired)      add("expiry");
+    if (tlsIgnoreMask & TlsIgnoreWrongUsage)   add("key usage");
+    return out;
+}
+
 MessageSink MakeStdoutLineSink() {
     auto mx = std::make_shared<std::mutex>();
     return [mx](const std::string& message) {

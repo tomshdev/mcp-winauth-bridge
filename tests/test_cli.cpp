@@ -89,6 +89,66 @@ TEST_CASE("boolean flags take no value") {
     CHECK(r.cfg.url == L"https://server/mcp");
 }
 
+TEST_CASE("TLS checks are all enforced by default") {
+    CHECK(MustParse({L"https://server/mcp"}).cfg.tlsIgnore == TlsIgnoreNothing);
+}
+
+TEST_CASE("--insecure and -k waive every check") {
+    CHECK(MustParse({L"--insecure", L"u"}).cfg.tlsIgnore == TlsIgnoreEverything);
+    CHECK(MustParse({L"-k", L"u"}).cfg.tlsIgnore == TlsIgnoreEverything);
+    // -k is two characters, so it must be matched before the "--" branch or
+    // it gets mistaken for the url.
+    CHECK(MustParse({L"-k", L"https://server/mcp"}).cfg.url == L"https://server/mcp");
+}
+
+TEST_CASE("--tls-ignore waives only what it names") {
+    CHECK(MustParse({L"--tls-ignore", L"unknown-ca", L"u"}).cfg.tlsIgnore == TlsIgnoreUnknownCa);
+    CHECK(MustParse({L"--tls-ignore", L"name", L"u"}).cfg.tlsIgnore == TlsIgnoreNameMismatch);
+    CHECK(MustParse({L"--tls-ignore", L"expired", L"u"}).cfg.tlsIgnore == TlsIgnoreExpired);
+    CHECK(MustParse({L"--tls-ignore", L"usage", L"u"}).cfg.tlsIgnore == TlsIgnoreWrongUsage);
+    CHECK(MustParse({L"--tls-ignore", L"all", L"u"}).cfg.tlsIgnore == TlsIgnoreEverything);
+}
+
+TEST_CASE("--tls-ignore takes a comma separated list and accumulates") {
+    // The case that matters: an https://<ip>/ url with a private CA needs the
+    // name check waived but should still require a trusted chain... and here
+    // the caller asked for both.
+    const unsigned both = TlsIgnoreUnknownCa | TlsIgnoreNameMismatch;
+    CHECK(MustParse({L"--tls-ignore", L"unknown-ca,name", L"u"}).cfg.tlsIgnore == both);
+    CHECK(MustParse({L"--tls-ignore", L"name,unknown-ca", L"u"}).cfg.tlsIgnore == both);
+    CHECK(MustParse({L"--tls-ignore", L"name", L"--tls-ignore", L"unknown-ca", L"u"}).cfg.tlsIgnore == both);
+    CHECK(MustParse({L"--tls-ignore", L"name,name", L"u"}).cfg.tlsIgnore == TlsIgnoreNameMismatch);
+}
+
+TEST_CASE("--tls-ignore rejects nonsense") {
+    ParseFails({L"--tls-ignore", L"u"});                  // consumes the url, none left
+    ParseFails({L"--tls-ignore", L"bogus", L"u"});
+    ParseFails({L"--tls-ignore", L"name,bogus", L"u"});
+    ParseFails({L"--tls-ignore", L"", L"u"});
+    ParseFails({L"--tls-ignore", L"name,", L"u"});
+    ParseFails({L"https://server/mcp", L"--tls-ignore"}); // missing value
+}
+
+TEST_CASE("only the CA and name waivers defeat the server's identity") {
+    // Which ones count decides whether credentials may be widened beyond the
+    // Intranet zone, so it is worth pinning down.
+    CHECK((TlsIgnoreUnknownCa    & kTlsIgnoreDefeatsIdentity) != 0);
+    CHECK((TlsIgnoreNameMismatch & kTlsIgnoreDefeatsIdentity) != 0);
+    // An expired or wrong-usage cert still chains to a trusted CA for the
+    // right name, so it still says who the peer is.
+    CHECK((TlsIgnoreExpired      & kTlsIgnoreDefeatsIdentity) == 0);
+    CHECK((TlsIgnoreWrongUsage   & kTlsIgnoreDefeatsIdentity) == 0);
+}
+
+TEST_CASE("DescribeTlsIgnore names the waived checks") {
+    CHECK(DescribeTlsIgnore(TlsIgnoreNothing) == "nothing");
+    CHECK(DescribeTlsIgnore(TlsIgnoreUnknownCa) == "untrusted CA");
+    CHECK(DescribeTlsIgnore(TlsIgnoreUnknownCa | TlsIgnoreNameMismatch) ==
+          "untrusted CA, name mismatch");
+    CHECK(DescribeTlsIgnore(TlsIgnoreEverything) ==
+          "untrusted CA, name mismatch, expiry, key usage");
+}
+
 TEST_CASE("credentials over plain http need an explicit opt-in") {
     // Sending a Negotiate/NTLM exchange over http exposes it to the path, so
     // the default must not be to do it silently.
@@ -116,7 +176,7 @@ TEST_CASE("usage text names the program and every option") {
     CHECK(usage.find("mcp-winauth-bridge") != std::string::npos);
     for (const char* flag : {"--workers", "--queue-depth", "--log-level", "--drain-timeout",
                              "--no-autologon", "--allow-insecure-auth", "--no-delete-session",
-                             "--version"}) {
+                             "--insecure", "--tls-ignore", "unknown-ca", "--version"}) {
         CAPTURE(flag);
         CHECK(usage.find(flag) != std::string::npos);
     }

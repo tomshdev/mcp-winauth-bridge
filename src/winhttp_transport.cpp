@@ -115,12 +115,21 @@ private:
         return conn;
     }
 
+    // True when TLS actually proved who the server is. Waiving the CA or the
+    // name check means it did not, and https then buys no more identity than
+    // plain http does.
+    bool PeerIdentityVerified() const {
+        if (!target_.secure) return false;
+        return (cfg_.tlsIgnore & kTlsIgnoreDefeatsIdentity) == 0;
+    }
+
     mutable std::mutex mx_;
     HINTERNET          session_ = nullptr;
     Config             cfg_;
     ParsedUrl          target_;
     LogSink            log_;
     std::once_flag     insecureAuthWarned_;
+    std::once_flag     tlsWaivedWarned_;
 };
 
 ResponseHead WinHttpTransport::Request(HttpVerb           verb,
@@ -156,20 +165,39 @@ ResponseHead WinHttpTransport::Request(HttpVerb           verb,
     WinHttpSetOption(req.h, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy,
                      sizeof(redirectPolicy));
 
+    if (target_.secure && cfg_.tlsIgnore != TlsIgnoreNothing) {
+        DWORD secFlags = 0;
+        if (cfg_.tlsIgnore & TlsIgnoreUnknownCa)    secFlags |= SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+        if (cfg_.tlsIgnore & TlsIgnoreNameMismatch) secFlags |= SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+        if (cfg_.tlsIgnore & TlsIgnoreExpired)      secFlags |= SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+        if (cfg_.tlsIgnore & TlsIgnoreWrongUsage)   secFlags |= SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(req.h, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+
+        std::call_once(tlsWaivedWarned_, [this] {
+            Log(LogLevel::Warn, "TLS checks waived: " + DescribeTlsIgnore(cfg_.tlsIgnore) +
+                                    ". The connection is encrypted but the server is not "
+                                    "fully verified.");
+        });
+    }
+
     if (cfg_.autologonAnyHost) {
         // Without this, WinHTTP only auto-sends the logged-in user's
         // credentials to hosts in the Intranet zone, which most corporate MCP
-        // endpoints are not. Over plain http, though, the Negotiate/NTLM
-        // exchange is visible to anyone on the path and can be relayed, so it
-        // takes an explicit opt-in.
-        if (target_.secure || cfg_.allowInsecureAuth) {
+        // endpoints are not. That widening is gated on actually knowing who
+        // the server is: otherwise the Negotiate/NTLM exchange can be
+        // intercepted and relayed, so it takes an explicit opt-in.
+        if (PeerIdentityVerified() || cfg_.allowInsecureAuth) {
             DWORD policy = WINHTTP_AUTOLOGON_SECURITY_LEVEL_LOW;
             WinHttpSetOption(req.h, WINHTTP_OPTION_AUTOLOGON_POLICY, &policy, sizeof(policy));
         } else {
             std::call_once(insecureAuthWarned_, [this] {
+                const char* why = target_.secure
+                                      ? "TLS identity waived"
+                                      : "plain http";
                 Log(LogLevel::Warn,
-                    "plain http: not sending credentials outside the Intranet zone. "
-                    "Use https, or pass --allow-insecure-auth if you accept the risk.");
+                    std::string(why) +
+                        ": not sending credentials outside the Intranet zone. Use a verified "
+                        "https url, or pass --allow-insecure-auth if you accept the risk.");
             });
         }
     }

@@ -76,7 +76,9 @@ Get-Content requests.jsonl | .\mcp-winauth-bridge.exe --log-level debug https://
 | `--drain-timeout <ms>` | `0` | Wait for in-flight requests at exit; `0` waits forever |
 | `--log-level <l>` | `info` | `error`, `warn`, `info`, `debug` |
 | `--no-autologon` | off | Only send credentials to Intranet-zone hosts |
-| `--allow-insecure-auth` | off | Allow Windows auth over plain `http` |
+| `--allow-insecure-auth` | off | Allow Windows auth to a host TLS did not identify |
+| `-k`, `--insecure` | off | Waive every TLS certificate check |
+| `--tls-ignore <list>` | none | Waive only some: `unknown-ca`, `name`, `expired`, `usage`, `all` |
 | `--no-delete-session` | off | Skip the `DELETE` that ends the server session |
 | `-h`, `--help` | | |
 | `--version` | | |
@@ -95,6 +97,34 @@ per line.
   the client never waits forever. Notifications get nothing, correctly.
 - **Not supported:** the optional server-to-client `GET` stream, and SSE resume
   via `Last-Event-ID`.
+
+### Self-signed certificates and IP-address URLs
+
+A private CA, a self-signed certificate or an `https://10.0.0.50/mcp` style
+URL all fail certificate validation, and WinHTTP refuses the connection with
+error `12175`. Two ways past it:
+
+```powershell
+# Blunt: waive every check, like curl -k
+mcp-winauth-bridge.exe -k https://10.0.0.50/mcp
+
+# Better: waive only what is actually wrong
+mcp-winauth-bridge.exe --tls-ignore name https://10.0.0.50/mcp
+mcp-winauth-bridge.exe --tls-ignore unknown-ca https://mcp.corp.local/mcp
+```
+
+Prefer `--tls-ignore`. An IP-address URL against a properly issued
+certificate only breaks the **name** check, and waiving just that keeps the
+chain verified; `--insecure` throws away the expiry and key-usage checks too,
+for no benefit.
+
+**Waiving `unknown-ca` or `name` means TLS no longer proves who the server
+is**, so the bridge treats the connection like plain `http` for credential
+purposes: it will not widen the autologon policy beyond the Intranet zone
+unless you also pass `--allow-insecure-auth`. Encrypted is not the same as
+authenticated, and an unauthenticated peer can relay a Negotiate exchange.
+Waiving `expired` or `usage` does not trigger this, because the chain and the
+name are still proven.
 
 ### Troubleshooting authentication
 
@@ -228,9 +258,11 @@ Three details worth knowing:
   `Mcp-Session-Id`, exactly one request may be in flight; otherwise a burst of
   concurrent first requests makes the server open a session per request and
   only the last one survives. After that the pool runs fully concurrent.
-- **Credentials are not volunteered over plain http.** The relaxed autologon
-  policy is applied only to `https` targets unless `--allow-insecure-auth`
-  says otherwise, and redirects are barred from downgrading https to http.
+- **Credentials are not volunteered to an unidentified host.** The relaxed
+  autologon policy is applied only when TLS actually proved who the server
+  is, which rules out plain `http` and any run that waived the CA or name
+  check, unless `--allow-insecure-auth` says otherwise. Redirects are also
+  barred from downgrading https to http.
 - **A server-supplied `Mcp-Session-Id` is validated** against the spec's
   visible-ASCII charset before it is echoed into later requests. WinHTTP will
   hand back a folded header value containing whitespace and control
