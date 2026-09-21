@@ -34,16 +34,22 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      # A real sha256sum-format file, so `sha256sum -c SHA256SUMS.txt` works.
+      # certutil's output has a header and a trailer and is not checkable.
       - name: Stage the artifacts
-        shell: cmd
         run: |
-          mkdir dist
-          copy build\mcp-winauth-bridge.exe dist\
-          cd dist
-          certutil -hashfile mcp-winauth-bridge.exe SHA256 > SHA256SUMS.txt
-          type SHA256SUMS.txt
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\mcp-winauth-bridge.exe dist\
+          $hash = (Get-FileHash dist\mcp-winauth-bridge.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  mcp-winauth-bridge.exe" | Set-Content dist\SHA256SUMS.txt -Encoding ascii
+          Get-Content dist\SHA256SUMS.txt
 
+      # The assets are named one by one: PowerShell does not expand globs for
+      # native commands, so `dist/*` would reach gh as a literal path.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" --generate-notes dist/*
+        run: >
+          gh release create "${{ github.ref_name }}" --generate-notes
+          dist/mcp-winauth-bridge.exe
+          dist/SHA256SUMS.txt
