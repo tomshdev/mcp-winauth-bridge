@@ -150,17 +150,24 @@ void Bridge::Impl::Handle(const std::string& message) {
     const ResponseHead head =
         transport->Request(HttpVerb::Post, message, currentSession, onHead, onChunk);
 
-    if (head.statusCode >= 200 && head.statusCode < 300) {
+    const bool ok2xx = head.statusCode >= 200 && head.statusCode < 300;
+    if (ok2xx && head.complete) {
         if (framer) framer->Finish();
         slot.MarkOk();
         completed.fetch_add(1);
         return;
     }
 
+    // A truncated body is deliberately not flushed: whatever the framer is
+    // still holding is a fragment, and emitting it would look like a message.
     failed.fetch_add(1);
-    const std::string reason =
-        head.statusCode ? ("HTTP " + std::to_string(head.statusCode))
-                        : ("transport error " + std::to_string(head.win32Error));
+    std::string reason;
+    if (!head.statusCode)
+        reason = "transport error " + std::to_string(head.win32Error);
+    else if (!head.complete)
+        reason = "truncated response body (win32 " + std::to_string(head.win32Error) + ")";
+    else
+        reason = "HTTP " + std::to_string(head.statusCode);
     Log(LogLevel::Error, "request failed: " + reason);
     // Without this the client waits forever for a reply that will never come.
     Emit(MakeFailureReply(message, "bridge: request failed (" + reason + ")"));
@@ -193,7 +200,14 @@ void Bridge::Impl::WorkerLoop() {
             Emit(MakeFailureReply(message, "bridge: internal error"));
         }
 
-        active.fetch_sub(1);
+        // The decrement has to happen under qmx, not merely atomically: the
+        // drain in DoShutdown evaluates its predicate while holding qmx, and
+        // an unlocked decrement plus notify can slip in just before it waits,
+        // costing it the wakeup and the whole drain timeout.
+        {
+            std::lock_guard<std::mutex> lock(qmx);
+            active.fetch_sub(1);
+        }
         idleCv.notify_all();
     }
 }

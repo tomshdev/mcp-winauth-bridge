@@ -81,11 +81,19 @@ TEST_CASE("log levels") {
 }
 
 TEST_CASE("boolean flags take no value") {
-    const CliResult r =
-        MustParse({L"--no-autologon", L"--no-delete-session", L"https://server/mcp"});
+    const CliResult r = MustParse({L"--no-autologon", L"--no-delete-session",
+                                   L"--allow-insecure-auth", L"https://server/mcp"});
     CHECK_FALSE(r.cfg.autologonAnyHost);
     CHECK_FALSE(r.cfg.deleteSessionOnShutdown);
+    CHECK(r.cfg.allowInsecureAuth);
     CHECK(r.cfg.url == L"https://server/mcp");
+}
+
+TEST_CASE("credentials over plain http need an explicit opt-in") {
+    // Sending a Negotiate/NTLM exchange over http exposes it to the path, so
+    // the default must not be to do it silently.
+    CHECK_FALSE(MustParse({L"http://server/mcp"}).cfg.allowInsecureAuth);
+    CHECK(MustParse({L"--allow-insecure-auth", L"http://server/mcp"}).cfg.allowInsecureAuth);
 }
 
 TEST_CASE("the user agent is taken verbatim") {
@@ -107,7 +115,8 @@ TEST_CASE("usage text names the program and every option") {
     const std::string usage = UsageText("mcp-winauth-bridge");
     CHECK(usage.find("mcp-winauth-bridge") != std::string::npos);
     for (const char* flag : {"--workers", "--queue-depth", "--log-level", "--drain-timeout",
-                             "--no-autologon", "--no-delete-session", "--version"}) {
+                             "--no-autologon", "--allow-insecure-auth", "--no-delete-session",
+                             "--version"}) {
         CAPTURE(flag);
         CHECK(usage.find(flag) != std::string::npos);
     }

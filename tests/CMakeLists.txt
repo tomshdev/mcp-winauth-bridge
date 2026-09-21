@@ -5,6 +5,7 @@ add_executable(mcpwa_tests
   test_main.cpp
   test_jsonrpc.cpp
   test_framing.cpp
+  test_headers.cpp
   test_url.cpp
   test_cli.cpp
   test_bridge_fake_transport.cpp)

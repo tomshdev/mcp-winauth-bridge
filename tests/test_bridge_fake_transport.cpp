@@ -250,6 +250,27 @@ TEST_CASE("a failed request answers the client instead of leaving it hanging") {
         REQUIRE(emitted.size() == 1);
         CHECK(emitted[0].find("12029") != std::string::npos);
     }
+    SUBCASE("a 2xx whose body was cut short is a failure, not a short message") {
+        Harness h(BaseConfig(1));
+        Reply   truncated;
+        truncated.status     = 200;
+        truncated.body       = R"({"jsonrpc":"2.0","id":1,"resu)";
+        truncated.complete   = false;
+        truncated.win32Error = 12030;
+        h.fake->replies      = {truncated};
+        REQUIRE(static_cast<bool>(h.bridge->Start()));
+        REQUIRE(h.bridge->Submit(kReq1));
+        h.bridge->Shutdown();
+
+        const auto emitted = h.Emitted();
+        REQUIRE(emitted.size() == 1);
+        // The fragment must not be emitted as if it were a message.
+        CHECK(emitted[0].find("truncated") != std::string::npos);
+        CHECK(emitted[0].find("-32603") != std::string::npos);
+        CHECK(emitted[0].find("12030") != std::string::npos);
+        CHECK(h.bridge->GetStats().failed == 1);
+        CHECK(h.bridge->GetStats().completed == 0);
+    }
     SUBCASE("a failed notification gets no reply") {
         Harness h(BaseConfig(1));
         h.fake->replies = {Reply{500, "application/json", "", "", 0}};
@@ -306,6 +327,30 @@ TEST_CASE("a bad url is reported without a transport") {
     const Error e = bridge.Start();
     CHECK_FALSE(static_cast<bool>(e));
     CHECK(e.status == Status::BadUrl);
+}
+
+TEST_CASE("a clean finish does not trip the drain timeout") {
+    // The drain waits on a predicate guarded by the queue mutex. If a worker
+    // signalled completion outside that mutex, the wakeup could be lost and a
+    // perfectly healthy shutdown would burn the whole timeout, then declare
+    // the requests abandoned and skip the session DELETE.
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        Config cfg         = BaseConfig(4);
+        cfg.drainTimeoutMs = 4000;
+        Harness h(cfg);
+        h.fake->replies = {Reply{200, "application/json", "sess-1", "{}", 0, true}};
+        REQUIRE(static_cast<bool>(h.bridge->Start()));
+        for (int i = 0; i < 8; ++i) REQUIRE(h.bridge->Submit(kReq1));
+
+        const auto start = std::chrono::steady_clock::now();
+        h.bridge->Shutdown();
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        REQUIRE_FALSE(h.fake->aborted.load());
+        CHECK(elapsed < 2s);
+        const auto order = h.fake->Order();
+        CHECK(order.back() == HttpVerb::Delete);
+    }
 }
 
 TEST_CASE("the drain timeout abandons a stuck request instead of hanging forever") {

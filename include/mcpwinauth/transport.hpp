@@ -18,7 +18,12 @@ struct ResponseHead {
     unsigned long statusCode = 0;  // 0 means the request never got a response
     unsigned long win32Error = 0;
     std::string   contentType;     // lowercased
-    std::string   sessionId;       // Mcp-Session-Id, "" when absent
+    std::string   sessionId;       // Mcp-Session-Id, "" when absent or invalid
+
+    // False when the body was cut short by a read error. A 2xx with a
+    // truncated body is a failure: the caller must not treat what arrived as
+    // a complete message.
+    bool complete = true;
 };
 
 // Body bytes in arrival order, on the calling thread.

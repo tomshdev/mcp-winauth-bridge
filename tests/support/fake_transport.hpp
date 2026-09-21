@@ -27,6 +27,7 @@ struct Reply {
     std::string   sessionId;
     std::string   body;
     unsigned long win32Error  = 0;
+    bool          complete    = true;  // false simulates a body cut short
 };
 
 class FakeTransport final : public ITransport {
@@ -67,6 +68,7 @@ public:
         head.win32Error  = reply.win32Error;
         head.contentType = reply.contentType;
         head.sessionId   = reply.sessionId;
+        head.complete    = reply.complete;
 
         if (reply.status != 0) {
             if (onHead) onHead(head);

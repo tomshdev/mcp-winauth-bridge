@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 
+#include "mcpwinauth/headers.hpp"
 #include "mcpwinauth/transport.hpp"
 
 #pragma comment(lib, "winhttp.lib")
@@ -13,10 +14,15 @@
 namespace mcpwinauth {
 namespace {
 
+// Control characters are mapped out too, not just non-ASCII: a CR or LF that
+// survived into a header value would let a server inject headers downstream.
 std::string NarrowAscii(const std::wstring& s) {
     std::string out;
     out.reserve(s.size());
-    for (const wchar_t c : s) out += (c < 128) ? static_cast<char>(c) : '?';
+    for (const wchar_t c : s) {
+        const bool printable = c >= 0x20 && c < 0x7F;
+        out += printable ? static_cast<char>(c) : '?';
+    }
     return out;
 }
 
@@ -92,9 +98,21 @@ private:
         if (log_) log_(level, text);
     }
 
-    HINTERNET Session() {
+    // Creates the connection handle while holding the lock. WinHttpConnect
+    // does no network I/O, so this is brief, and it means Abort() can never
+    // close the session handle out from under a caller that has snapshotted
+    // it. Past this point we only touch our own child handles.
+    HINTERNET Connect(unsigned long& win32) {
         std::lock_guard<std::mutex> lock(mx_);
-        return session_;
+        if (!session_) {
+            // Not a connect failure: the session was closed under us, so
+            // GetLastError() would be stale and misleading.
+            win32 = ERROR_WINHTTP_OPERATION_CANCELLED;
+            return nullptr;
+        }
+        HINTERNET conn = WinHttpConnect(session_, target_.host.c_str(), target_.port, 0);
+        if (!conn) win32 = GetLastError();
+        return conn;
     }
 
     mutable std::mutex mx_;
@@ -102,6 +120,7 @@ private:
     Config             cfg_;
     ParsedUrl          target_;
     LogSink            log_;
+    std::once_flag     insecureAuthWarned_;
 };
 
 ResponseHead WinHttpTransport::Request(HttpVerb           verb,
@@ -111,16 +130,9 @@ ResponseHead WinHttpTransport::Request(HttpVerb           verb,
                                        const BodyChunkFn& onChunk) {
     ResponseHead head;
 
-    HINTERNET session = Session();
-    if (!session) {
-        head.win32Error = ERROR_WINHTTP_OPERATION_CANCELLED;
-        return head;
-    }
-
     HandleGuard conn;
-    conn.h = WinHttpConnect(session, target_.host.c_str(), target_.port, 0);
+    conn.h = Connect(head.win32Error);
     if (!conn.h) {
-        head.win32Error = GetLastError();
         Log(LogLevel::Error, "connect failed: " + std::to_string(head.win32Error));
         return head;
     }
@@ -137,17 +149,38 @@ ResponseHead WinHttpTransport::Request(HttpVerb           verb,
         return head;
     }
 
+    // Never let a redirect downgrade to plain http: the credentials attached
+    // below would follow it. This is also WinHTTP's default, stated here so a
+    // changed process-wide default cannot weaken it.
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    WinHttpSetOption(req.h, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy,
+                     sizeof(redirectPolicy));
+
     if (cfg_.autologonAnyHost) {
         // Without this, WinHTTP only auto-sends the logged-in user's
-        // credentials to hosts in the Intranet zone.
-        DWORD policy = WINHTTP_AUTOLOGON_SECURITY_LEVEL_LOW;
-        WinHttpSetOption(req.h, WINHTTP_OPTION_AUTOLOGON_POLICY, &policy, sizeof(policy));
+        // credentials to hosts in the Intranet zone, which most corporate MCP
+        // endpoints are not. Over plain http, though, the Negotiate/NTLM
+        // exchange is visible to anyone on the path and can be relayed, so it
+        // takes an explicit opt-in.
+        if (target_.secure || cfg_.allowInsecureAuth) {
+            DWORD policy = WINHTTP_AUTOLOGON_SECURITY_LEVEL_LOW;
+            WinHttpSetOption(req.h, WINHTTP_OPTION_AUTOLOGON_POLICY, &policy, sizeof(policy));
+        } else {
+            std::call_once(insecureAuthWarned_, [this] {
+                Log(LogLevel::Warn,
+                    "plain http: not sending credentials outside the Intranet zone. "
+                    "Use https, or pass --allow-insecure-auth if you accept the risk.");
+            });
+        }
     }
 
     std::wstring headers =
         L"Content-Type: application/json\r\n"
         L"Accept: application/json, text/event-stream\r\n";
-    if (!sessionId.empty()) headers += L"Mcp-Session-Id: " + Utf8ToWide(sessionId) + L"\r\n";
+    // Already validated where it was read, but this is the point where a bad
+    // value would become injected headers, so it is checked again here.
+    if (!sessionId.empty() && IsValidSessionId(sessionId))
+        headers += L"Mcp-Session-Id: " + Utf8ToWide(sessionId) + L"\r\n";
     WinHttpAddRequestHeaders(req.h, headers.c_str(), static_cast<DWORD>(-1),
                              WINHTTP_ADDREQ_FLAG_ADD);
 
@@ -159,7 +192,11 @@ ResponseHead WinHttpTransport::Request(HttpVerb           verb,
                                 static_cast<DWORD>(body.size()), 0) ||
             !WinHttpReceiveResponse(req.h, nullptr)) {
             head.win32Error = GetLastError();
-            Log(LogLevel::Error, "send failed: " + std::to_string(head.win32Error));
+            // The attempt number matters: a failure on attempt 0 is the
+            // server or the network, one on a later attempt is the auth
+            // handshake.
+            Log(LogLevel::Error, "send failed on attempt " + std::to_string(attempt) + ": " +
+                                     std::to_string(head.win32Error));
             return head;
         }
 
@@ -171,6 +208,18 @@ ResponseHead WinHttpTransport::Request(HttpVerb           verb,
             return head;
         }
         if (status != HTTP_STATUS_DENIED) break;
+
+        // The challenge usually carries a body (IIS and most frameworks send
+        // one). WinHTTP discards it by itself when the handle is reused, so
+        // this is belt and braces rather than a fix for an observed failure;
+        // it costs one call that returns zero bytes when there is nothing
+        // left, and it keeps the handle in a state we can reason about.
+        {
+            char  sink[4096];
+            DWORD drained = 0;
+            while (WinHttpReadData(req.h, sink, sizeof(sink), &drained) && drained > 0) {
+            }
+        }
 
         // 401: answer as the current Windows user. NULL credentials is what
         // makes WinHTTP use the logged-in token rather than a supplied one.
@@ -191,14 +240,34 @@ ResponseHead WinHttpTransport::Request(HttpVerb           verb,
 
     head.statusCode  = status;
     head.contentType = Lower(NarrowAscii(QueryHeader(req.h, L"Content-Type")));
-    head.sessionId   = NarrowAscii(QueryHeader(req.h, L"Mcp-Session-Id"));
+
+    const std::string rawSession = NarrowAscii(QueryHeader(req.h, L"Mcp-Session-Id"));
+    if (!rawSession.empty()) {
+        if (IsValidSessionId(rawSession)) {
+            head.sessionId = rawSession;
+        } else {
+            // Refusing it costs us session continuity; accepting it would let
+            // the server dictate the headers of every later request.
+            Log(LogLevel::Warn,
+                "ignoring a malformed Mcp-Session-Id: " + SanitizeHeaderValue(rawSession));
+        }
+    }
     if (onHead) onHead(head);
 
     if (status < 200 || status >= 300) return head;
 
-    char  chunk[8192];
-    DWORD read = 0;
-    while (WinHttpReadData(req.h, chunk, sizeof(chunk), &read) && read > 0) {
+    char chunk[8192];
+    for (;;) {
+        DWORD read = 0;
+        if (!WinHttpReadData(req.h, chunk, sizeof(chunk), &read)) {
+            // A read error is not end of body. Reporting it as one would hand
+            // the caller a truncated message and call it a success.
+            head.win32Error = GetLastError();
+            head.complete   = false;
+            Log(LogLevel::Error, "response body cut short: " + std::to_string(head.win32Error));
+            return head;
+        }
+        if (read == 0) break;  // end of body
         if (onChunk) onChunk(chunk, read);
     }
     return head;

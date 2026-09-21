@@ -33,9 +33,15 @@ struct Config {
     unsigned maxQueueDepth  = 256;  // 0 = unbounded, otherwise Submit() blocks
     unsigned maxAuthRetries = 3;    // attempts in the 401 loop
 
-    bool     autologonAnyHost        = true;  // send the current user to any host
+    // Send the logged-in user's credentials to hosts outside the Intranet
+    // zone. Needed for most corporate endpoints, which are rarely zoned.
+    bool autologonAnyHost = true;
+    // ...and over plain http, where a Negotiate/NTLM exchange is exposed to
+    // anyone on the path and can be relayed. Off unless you ask for it.
+    bool allowInsecureAuth = false;
+
     bool     deleteSessionOnShutdown = true;
-    unsigned drainTimeoutMs          = 0;     // 0 = wait for in-flight forever
+    unsigned drainTimeoutMs          = 0;  // 0 = wait for in-flight forever
 
     LogLevel logLevel = LogLevel::Info;
 };

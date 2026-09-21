@@ -23,6 +23,7 @@ endif()
 add_library(mcpwinauth_bridge STATIC
   src/jsonrpc.cpp
   src/framing.cpp
+  src/headers.cpp
   src/url.cpp
   src/cli.cpp
   src/sinks.cpp

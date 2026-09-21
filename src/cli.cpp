@@ -96,6 +96,8 @@ Error ParseArgs(const std::vector<std::wstring>& args, CliResult& out) {
                 else return BadArg(L"--log-level must be error, warn, info or debug");
             } else if (a == L"--no-autologon") {
                 out.cfg.autologonAnyHost = false;
+            } else if (a == L"--allow-insecure-auth") {
+                out.cfg.allowInsecureAuth = true;
             } else if (a == L"--no-delete-session") {
                 out.cfg.deleteSessionOnShutdown = false;
             } else {
@@ -133,6 +135,7 @@ std::string UsageText(const std::string& programName) {
         "  --drain-timeout <ms>     Wait for in-flight requests at exit, 0 = forever (default 0)\n"
         "  --log-level <l>          error | warn | info | debug (default info)\n"
         "  --no-autologon           Do not send credentials to non-intranet hosts\n"
+        "  --allow-insecure-auth    Allow Windows auth over plain http (exposes the exchange)\n"
         "  --no-delete-session      Skip the DELETE that ends the server session\n"
         "  -h, --help               Show this help\n"
         "      --version            Show the version\n";

@@ -76,6 +76,7 @@ Get-Content requests.jsonl | .\mcp-winauth-bridge.exe --log-level debug https://
 | `--drain-timeout <ms>` | `0` | Wait for in-flight requests at exit; `0` waits forever |
 | `--log-level <l>` | `info` | `error`, `warn`, `info`, `debug` |
 | `--no-autologon` | off | Only send credentials to Intranet-zone hosts |
+| `--allow-insecure-auth` | off | Allow Windows auth over plain `http` |
 | `--no-delete-session` | off | Skip the `DELETE` that ends the server session |
 | `-h`, `--help` | | |
 | `--version` | | |
@@ -102,11 +103,16 @@ per line.
 - **Kerberos falls back to NTLM, or fails outright** — usually a missing or
   duplicate SPN on the service account. Check with
   `setspn -L <service-account>` and `klist`.
-- **401 even though you are domain-joined** — by default the bridge passes
-  `WINHTTP_AUTOLOGON_SECURITY_LEVEL_LOW`, which lets WinHTTP send your
+- **401 even though you are domain-joined** — over **https** the bridge
+  passes `WINHTTP_AUTOLOGON_SECURITY_LEVEL_LOW`, which lets WinHTTP send your
   credentials to any host rather than only Intranet-zone ones. If your policy
   forbids that, run with `--no-autologon` and add the host to the Local
   Intranet zone instead.
+- **`plain http: not sending credentials outside the Intranet zone`** — over
+  plain `http` a Negotiate/NTLM exchange is visible to anyone on the path and
+  can be relayed, so the bridge will not widen the autologon policy for it.
+  Use `https`, or pass `--allow-insecure-auth` if you have decided the risk is
+  acceptable (a loopback test server, say).
 - Proxies are picked up from the system configuration automatically
   (`WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY`).
 
@@ -222,6 +228,17 @@ Three details worth knowing:
   `Mcp-Session-Id`, exactly one request may be in flight; otherwise a burst of
   concurrent first requests makes the server open a session per request and
   only the last one survives. After that the pool runs fully concurrent.
+- **Credentials are not volunteered over plain http.** The relaxed autologon
+  policy is applied only to `https` targets unless `--allow-insecure-auth`
+  says otherwise, and redirects are barred from downgrading https to http.
+- **A server-supplied `Mcp-Session-Id` is validated** against the spec's
+  visible-ASCII charset before it is echoed into later requests. WinHTTP will
+  hand back a folded header value containing whitespace and control
+  characters; concatenating one into a header block would let the server
+  inject headers of its own.
+- **A truncated response is a failure.** A read error part-way through a 2xx
+  body is reported as such rather than being mistaken for end-of-body, so the
+  caller never receives a fragment presented as a complete message.
 - **The shutdown `DELETE` cannot race in-flight requests.** Shutdown drains the
   queue and joins every worker before ending the session. With
   `--drain-timeout` set, a stuck request is abandoned by closing the WinHTTP
